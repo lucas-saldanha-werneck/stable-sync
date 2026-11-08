@@ -1,0 +1,53 @@
+#!/bin/sh
+# op-stable-sync
+# Keeps a real COPY (not a link) of the 1Password CLI (`op`) at a fixed path
+# (default ~/.local/bin/op), for the same reason as claude-stable-sync: macOS privacy permissions
+# follow the executable's path, and the Homebrew path changes with every version.
+#
+# Run by launchd (install.sh writes the job: when the Homebrew cask changes, at load, every hour).
+# Does nothing when the copy is already identical, or when `op` is not installed.
+#
+# Environment:
+#   OP_STABLE_SOURCE      op to copy from (default: Homebrew's op, /opt/homebrew or /usr/local)
+#   OP_STABLE_DEST        the copy (default ~/.local/bin/op)
+#   STABLE_SYNC_LOG_DIR   log folder (default ~/Library/Logs, or ~/.local/state/stable-sync)
+#   STABLE_SYNC_CODESIGN  codesign binary (default codesign; skipped with a note when missing)
+set -u
+DST="${OP_STABLE_DEST:-$HOME/.local/bin/op}"
+if [ -n "${STABLE_SYNC_LOG_DIR:-}" ]; then LOGDIR="$STABLE_SYNC_LOG_DIR"
+elif [ "$(uname -s)" = Darwin ]; then LOGDIR="$HOME/Library/Logs"
+else LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/stable-sync"; fi
+mkdir -p "$LOGDIR" 2>/dev/null
+LOG="$LOGDIR/op-stable-sync.log"
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
+
+resolve() {
+  readlink -f "$1" 2>/dev/null && return 0
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
+}
+
+LINK="${OP_STABLE_SOURCE:-}"
+if [ -z "$LINK" ]; then
+  for c in /opt/homebrew/bin/op /usr/local/bin/op; do [ -e "$c" ] && { LINK="$c"; break; }; done
+fi
+[ -n "$LINK" ] || exit 0   # op not installed: nothing to do
+SRC=$(resolve "$LINK") || SRC=""
+[ -n "$SRC" ] && [ -f "$SRC" ] && [ -x "$SRC" ] || exit 0
+DST_REAL=$(resolve "$DST") || DST_REAL="$DST"
+if [ "$SRC" = "$DST_REAL" ]; then
+  log "error: $LINK is the stable copy itself - set OP_STABLE_SOURCE to the installed op"; exit 1
+fi
+cmp -s "$SRC" "$DST" && exit 0   # already identical
+
+mkdir -p "$(dirname "$DST")" || { log "error: cannot create $(dirname "$DST")"; exit 1; }
+cp -p "$SRC" "$DST.new" || { log "error: copy failed ($SRC)"; rm -f "$DST.new"; exit 1; }
+CS="${STABLE_SYNC_CODESIGN:-codesign}"
+if command -v "$CS" >/dev/null 2>&1; then
+  if ! "$CS" -v "$DST.new" 2>/dev/null; then
+    log "error: invalid code signature on the copy of $SRC - kept the previous copy"; rm -f "$DST.new"; exit 1
+  fi
+else
+  log "note: codesign not available - signature not checked"
+fi
+mv -f "$DST.new" "$DST" || { log "error: could not move the copy into place"; rm -f "$DST.new"; exit 1; }
+log "ok: copied $SRC -> $DST"
