@@ -1,7 +1,7 @@
 # stable-sync
 
-Keep a copy of the `claude` (Claude Code) and `op` (1Password CLI) binaries at a fixed path, so
-macOS privacy permissions such as Full Disk Access are granted once and survive every update.
+Keeps a fixed-path copy of `claude` (Claude Code) and `op` (1Password CLI) so macOS privacy
+permissions such as Full Disk Access are granted once and survive every update.
 
 ## Why
 
