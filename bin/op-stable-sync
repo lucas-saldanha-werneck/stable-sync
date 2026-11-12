@@ -1,8 +1,8 @@
 #!/bin/sh
 # op-stable-sync
 # Keeps a real COPY (not a link) of the 1Password CLI (`op`) at a fixed path
-# (default ~/.local/bin/op), for the same reason as claude-stable-sync: macOS privacy permissions
-# follow the executable's path, and the Homebrew path changes with every version.
+# (default ~/.local/bin/op). macOS privacy permissions follow the executable's path, and the
+# Homebrew path changes with every version; a symlink does not help (macOS follows it).
 #
 # Run by launchd (install.sh writes the job: when the Homebrew cask changes, at load, every hour).
 # Does nothing when the copy is already identical, or when `op` is not installed.
