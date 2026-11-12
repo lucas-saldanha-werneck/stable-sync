@@ -6,12 +6,13 @@
 #   ./install.sh --uninstall [--dry-run]
 #
 # Environment: INSTALL_BIN_DIR (default ~/.local/bin). CLAUDE_STABLE_SOURCE, CLAUDE_STABLE_DIR,
-# OP_STABLE_SOURCE and OP_STABLE_DEST, when set, are written into the jobs.
+# OP_STABLE_SOURCE, OP_STABLE_DEST, STABLE_SYNC_LOG_DIR, CLAUDE_STABLE_TEAM_ID, OP_STABLE_TEAM_ID,
+# STABLE_SYNC_ALERT_AFTER and STABLE_SYNC_ALERT_CMD, when set, are written into the jobs.
 set -u
 R="$(cd "$(dirname "$0")" && pwd)"
 BIN="${INSTALL_BIN_DIR:-$HOME/.local/bin}"
 LA="$HOME/Library/LaunchAgents"
-LOGDIR="$HOME/Library/Logs"
+LOGDIR="${STABLE_SYNC_LOG_DIR:-$HOME/Library/Logs}"
 PREFIX="${STABLE_SYNC_LABEL_PREFIX:-com.stable-sync.}"
 OS="${INSTALL_OS:-$(uname -s)}"   # INSTALL_OS: test hook
 DRY=0; LOAD=0; UNINSTALL=0; ONLY=""
@@ -52,10 +53,11 @@ if [ $UNINSTALL = 1 ]; then
   exit 0
 fi
 
-run mkdir -p "$BIN"
+run mkdir -p "$BIN" || { echo "install.sh: cannot create $BIN" >&2; exit 1; }
 for t in $TOOLS; do
-  run cp "$R/bin/$t-stable-sync" "$BIN/$t-stable-sync" && run chmod 755 "$BIN/$t-stable-sync" \
-    && echo "installed $BIN/$t-stable-sync"
+  { run cp "$R/bin/$t-stable-sync" "$BIN/$t-stable-sync" && run chmod 755 "$BIN/$t-stable-sync"; } \
+    || { echo "install.sh: could not install $BIN/$t-stable-sync; no job written" >&2; exit 1; }
+  echo "installed $BIN/$t-stable-sync"
 done
 
 if [ "$OS" != Darwin ]; then
@@ -68,7 +70,9 @@ BREW="$(brew --prefix 2>/dev/null || true)"
 
 env_block() {  # EnvironmentVariables with the variables that are set, for tool $1
   local names out="" n v
-  if [ "$1" = claude ]; then names="CLAUDE_STABLE_SOURCE CLAUDE_STABLE_DIR"; else names="OP_STABLE_SOURCE OP_STABLE_DEST"; fi
+  if [ "$1" = claude ]; then names="CLAUDE_STABLE_SOURCE CLAUDE_STABLE_DIR CLAUDE_STABLE_TEAM_ID"
+  else names="OP_STABLE_SOURCE OP_STABLE_DEST OP_STABLE_TEAM_ID"; fi
+  names="$names STABLE_SYNC_LOG_DIR STABLE_SYNC_ALERT_AFTER STABLE_SYNC_ALERT_CMD"
   for n in $names; do
     v="$(eval "printf '%s' \"\${$n:-}\"")"
     [ -n "$v" ] && out="$out
@@ -76,6 +80,12 @@ env_block() {  # EnvironmentVariables with the variables that are set, for tool 
 		<string>$(xml_escape "$v")</string>"
   done
   [ -n "$out" ] && printf '\t<key>EnvironmentVariables</key>\n\t<dict>%s\n\t</dict>\n' "$out"
+}
+
+valid_plist() {  # plutil on macOS, else Python's plistlib, else trust the heredoc
+  if command -v plutil >/dev/null 2>&1; then plutil -lint -s "$1" >/dev/null 2>&1
+  elif command -v python3 >/dev/null 2>&1; then python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$1" 2>/dev/null
+  else return 0; fi
 }
 
 plist() {  # $1 = claude|op
@@ -129,8 +139,12 @@ for t in $TOOLS; do
   if [ $DRY = 1 ]; then
     echo "(dry-run) would write $P:"; plist "$t"
   else
-    mkdir -p "$LA" "$LOGDIR"
-    plist "$t" | grep -v '^$' > "$P"
+    mkdir -p "$LA" "$LOGDIR" || { echo "install.sh: cannot create $LA or $LOGDIR" >&2; exit 1; }
+    # Written next to the old plist, checked, then moved over it: a failure leaves the old one.
+    TMPP=$(mktemp "$P.tmp.XXXXXX") || { echo "install.sh: cannot write in $LA" >&2; exit 1; }
+    if ! { plist "$t" | grep -v '^$' > "$TMPP" && valid_plist "$TMPP" && mv -f "$TMPP" "$P"; }; then
+      rm -f "$TMPP"; echo "install.sh: could not write a valid $P; the old one (if any) is kept" >&2; exit 1
+    fi
     echo "wrote $P"
   fi
   if [ $LOAD = 1 ]; then

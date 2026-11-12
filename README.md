@@ -22,8 +22,12 @@ fixed path does: grant the permission to the copy once, and it keeps working aft
 | `claude-stable-sync` | `~/.local/bin/claude` (followed to the real file) → `~/.local/libexec/claude-stable/claude` | launchd: when `versions/` or `~/.local/bin` changes, at load, every 15 min |
 | `op-stable-sync` | Homebrew's `op` → `~/.local/bin/op` | launchd: when the Homebrew cask changes, at load, every hour |
 
-Each copy is made next to the target, checked with `codesign -v` (a bad signature keeps the
-previous copy), then moved into place in one step. Nothing happens when the copy is current.
+Each copy is made in a temp file of its own next to the target, checked with `codesign -v` against
+the vendor's Team ID (Anthropic for Claude Code, 1Password for `op`; a bad or ad-hoc signature keeps
+the previous copy), then moved into place in one step. Nothing happens when the copy is current:
+for Claude Code, same source path, same size and the source not changed since the copy; for `op`,
+identical bytes. After 3 failures in a row, one alert goes out beyond the log (a macOS
+notification, or your own command).
 
 ```
 $ claude-stable-sync
@@ -66,7 +70,11 @@ Environment variables. When set during `./install.sh`, they are written into the
 | `CLAUDE_STABLE_DIR` | `~/.local/libexec/claude-stable` | folder of the Claude Code copy |
 | `OP_STABLE_SOURCE` | `/opt/homebrew/bin/op`, else `/usr/local/bin/op` | `op` to copy from |
 | `OP_STABLE_DEST` | `~/.local/bin/op` | the `op` copy |
-| `STABLE_SYNC_LOG_DIR` | `~/Library/Logs` | where `claude-stable-sync.log` and `op-stable-sync.log` go |
+| `STABLE_SYNC_LOG_DIR` | `~/Library/Logs` | where `claude-stable-sync.log` and `op-stable-sync.log` go (and the jobs' `.err` files) |
+| `CLAUDE_STABLE_TEAM_ID` | `Q6L2SF6YDW` (Anthropic) | Team ID the Claude Code signature must carry; empty = any valid signature |
+| `OP_STABLE_TEAM_ID` | `2BUA8C4S2C` (1Password) | Team ID the `op` signature must carry; empty = any valid signature |
+| `STABLE_SYNC_ALERT_AFTER` | `3` | failures in a row before the one alert |
+| `STABLE_SYNC_ALERT_CMD` | macOS notification | command run with the alert text as its only argument |
 
 ## Good to know
 

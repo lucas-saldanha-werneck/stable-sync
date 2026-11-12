@@ -12,6 +12,9 @@
 #   OP_STABLE_DEST        the copy (default ~/.local/bin/op)
 #   STABLE_SYNC_LOG_DIR   log folder (default ~/Library/Logs, or ~/.local/state/stable-sync)
 #   STABLE_SYNC_CODESIGN  codesign binary (default codesign; skipped with a note when missing)
+#   OP_STABLE_TEAM_ID     Team ID the signature must carry (default 2BUA8C4S2C, 1Password;
+#                         empty = any valid signature)
+#   STABLE_SYNC_ALERT_AFTER / STABLE_SYNC_ALERT_CMD  alert after N failures in a row (see below)
 set -u
 DST="${OP_STABLE_DEST:-$HOME/.local/bin/op}"
 if [ -n "${STABLE_SYNC_LOG_DIR:-}" ]; then LOGDIR="$STABLE_SYNC_LOG_DIR"
@@ -21,33 +24,69 @@ mkdir -p "$LOGDIR" 2>/dev/null
 LOG="$LOGDIR/op-stable-sync.log"
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
+# Failures in a row are counted; after STABLE_SYNC_ALERT_AFTER of them (default 3) one alert goes
+# out beyond the log: STABLE_SYNC_ALERT_CMD "<message>" if set, else a macOS notification.
+FAILS="$LOGDIR/op-stable-sync.failures"
+alert() {
+  if [ -n "${STABLE_SYNC_ALERT_CMD:-}" ]; then "$STABLE_SYNC_ALERT_CMD" "$1" 2>/dev/null
+  elif [ "$(uname -s)" = Darwin ] && command -v osascript >/dev/null 2>&1; then
+    osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "stable-sync"' \
+      -e 'end run' "$1" >/dev/null 2>&1
+  fi
+}
+fail() {  # log the error, count it, alert once per run of failures, exit 1
+  log "error: $*"
+  n=$(cat "$FAILS" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0 ;; esac; n=$((n + 1))
+  printf '%s\n' "$n" > "$FAILS" 2>/dev/null
+  [ "$n" = "${STABLE_SYNC_ALERT_AFTER:-3}" ] && alert "op-stable-sync failed $n times in a row: $* (log: $LOG)"
+  exit 1
+}
+good() { rm -f "$FAILS" 2>/dev/null; exit 0; }
+
 resolve() {
   readlink -f "$1" 2>/dev/null && return 0
-  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
+  # No `readlink -f` (macOS before 12.3): follow the links in plain shell, no python3 needed.
+  _p="$1"; _n=0
+  while [ -L "$_p" ]; do
+    _n=$((_n + 1)); [ $_n -gt 40 ] && return 1
+    _t=$(readlink "$_p") || return 1
+    case "$_t" in /*) _p="$_t" ;; *) _p="$(dirname "$_p")/$_t" ;; esac
+  done
+  [ -e "$_p" ] || return 1
+  _d=$(cd -P "$(dirname "$_p")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$_d" "$(basename "$_p")"
 }
 
 LINK="${OP_STABLE_SOURCE:-}"
 if [ -z "$LINK" ]; then
   for c in /opt/homebrew/bin/op /usr/local/bin/op; do [ -e "$c" ] && { LINK="$c"; break; }; done
 fi
-[ -n "$LINK" ] || exit 0   # op not installed: nothing to do
+[ -n "$LINK" ] || good   # op not installed: nothing to do
 SRC=$(resolve "$LINK") || SRC=""
-[ -n "$SRC" ] && [ -f "$SRC" ] && [ -x "$SRC" ] || exit 0
+[ -n "$SRC" ] && [ -f "$SRC" ] && [ -x "$SRC" ] || good
 DST_REAL=$(resolve "$DST") || DST_REAL="$DST"
 if [ "$SRC" = "$DST_REAL" ]; then
-  log "error: $LINK is the stable copy itself - set OP_STABLE_SOURCE to the installed op"; exit 1
+  fail "$LINK is the stable copy itself - set OP_STABLE_SOURCE to the installed op"
 fi
-cmp -s "$SRC" "$DST" && exit 0   # already identical
+cmp -s "$SRC" "$DST" && good   # already identical
 
-mkdir -p "$(dirname "$DST")" || { log "error: cannot create $(dirname "$DST")"; exit 1; }
-cp -p "$SRC" "$DST.new" || { log "error: copy failed ($SRC)"; rm -f "$DST.new"; exit 1; }
+mkdir -p "$(dirname "$DST")" || fail "cannot create $(dirname "$DST")"
+# A temp file of this run alone, next to the copy (same file system, so mv is atomic): two runs at
+# once never swap each other's checked copy.
+TMP=$(mktemp "$DST.new.XXXXXX") || fail "cannot create a temp file next to $DST"
+trap 'rm -f "$TMP"' EXIT
+cp -p "$SRC" "$TMP" || fail "copy failed ($SRC)"
 CS="${STABLE_SYNC_CODESIGN:-codesign}"
+TEAM="${OP_STABLE_TEAM_ID-2BUA8C4S2C}"
 if command -v "$CS" >/dev/null 2>&1; then
-  if ! "$CS" -v "$DST.new" 2>/dev/null; then
-    log "error: invalid code signature on the copy of $SRC - kept the previous copy"; rm -f "$DST.new"; exit 1
-  fi
+  if [ -n "$TEAM" ]; then
+    "$CS" -v -R="anchor apple generic and certificate leaf[subject.OU] = \"$TEAM\"" "$TMP" 2>/dev/null
+  else
+    "$CS" -v "$TMP" 2>/dev/null
+  fi || fail "invalid code signature (or not signed by team ${TEAM:-any}) on the copy of $SRC - kept the previous copy"
 else
   log "note: codesign not available - signature not checked"
 fi
-mv -f "$DST.new" "$DST" || { log "error: could not move the copy into place"; rm -f "$DST.new"; exit 1; }
+mv -f "$TMP" "$DST" || fail "could not move the copy into place"
 log "ok: copied $SRC -> $DST"
+good

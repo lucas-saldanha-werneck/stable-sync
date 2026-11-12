@@ -15,6 +15,9 @@
 #   CLAUDE_STABLE_DIR     folder of the copy (default ~/.local/libexec/claude-stable)
 #   STABLE_SYNC_LOG_DIR   log folder (default ~/Library/Logs, or ~/.local/state/stable-sync)
 #   STABLE_SYNC_CODESIGN  codesign binary (default codesign; skipped with a note when missing)
+#   CLAUDE_STABLE_TEAM_ID Team ID the signature must carry (default Q6L2SF6YDW, Anthropic;
+#                         empty = any valid signature)
+#   STABLE_SYNC_ALERT_AFTER / STABLE_SYNC_ALERT_CMD  alert after N failures in a row (see below)
 set -u
 SRC_LINK="${CLAUDE_STABLE_SOURCE:-$HOME/.local/bin/claude}"
 DIR="${CLAUDE_STABLE_DIR:-$HOME/.local/libexec/claude-stable}"
@@ -27,38 +30,73 @@ mkdir -p "$LOGDIR" 2>/dev/null
 LOG="$LOGDIR/claude-stable-sync.log"
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
+# Failures in a row are counted; after STABLE_SYNC_ALERT_AFTER of them (default 3) one alert goes
+# out beyond the log: STABLE_SYNC_ALERT_CMD "<message>" if set, else a macOS notification.
+FAILS="$LOGDIR/claude-stable-sync.failures"
+alert() {
+  if [ -n "${STABLE_SYNC_ALERT_CMD:-}" ]; then "$STABLE_SYNC_ALERT_CMD" "$1" 2>/dev/null
+  elif [ "$(uname -s)" = Darwin ] && command -v osascript >/dev/null 2>&1; then
+    osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "stable-sync"' \
+      -e 'end run' "$1" >/dev/null 2>&1
+  fi
+}
+fail() {  # log the error, count it, alert once per run of failures, exit 1
+  log "error: $*"
+  n=$(cat "$FAILS" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0 ;; esac; n=$((n + 1))
+  printf '%s\n' "$n" > "$FAILS" 2>/dev/null
+  [ "$n" = "${STABLE_SYNC_ALERT_AFTER:-3}" ] && alert "claude-stable-sync failed $n times in a row: $* (log: $LOG)"
+  exit 1
+}
+good() { rm -f "$FAILS" 2>/dev/null; exit 0; }
+
 resolve() {  # real path of $1, following every symlink
   readlink -f "$1" 2>/dev/null && return 0
-  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
+  # No `readlink -f` (macOS before 12.3): follow the links in plain shell, no python3 needed.
+  _p="$1"; _n=0
+  while [ -L "$_p" ]; do
+    _n=$((_n + 1)); [ $_n -gt 40 ] && return 1
+    _t=$(readlink "$_p") || return 1
+    case "$_t" in /*) _p="$_t" ;; *) _p="$(dirname "$_p")/$_t" ;; esac
+  done
+  [ -e "$_p" ] || return 1
+  _d=$(cd -P "$(dirname "$_p")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$_d" "$(basename "$_p")"
 }
 
 SRC=$(resolve "$SRC_LINK") || SRC=""
 if [ -z "$SRC" ] || [ ! -f "$SRC" ] || [ ! -x "$SRC" ]; then
-  log "error: $SRC_LINK does not lead to an executable file (set CLAUDE_STABLE_SOURCE)"; exit 1
+  fail "$SRC_LINK does not lead to an executable file (set CLAUDE_STABLE_SOURCE)"
 fi
 DST_REAL=$(resolve "$DST") || DST_REAL="$DST"
 if [ "$SRC" = "$DST_REAL" ]; then
-  log "error: $SRC_LINK points at the stable copy itself - point it at the installed Claude Code"; exit 1
+  fail "$SRC_LINK points at the stable copy itself - point it at the installed Claude Code"
 fi
-mkdir -p "$DIR" || { log "error: cannot create $DIR"; exit 1; }
+mkdir -p "$DIR" || fail "cannot create $DIR"
 
-if [ "${1:-}" != "--force" ] && [ -x "$DST" ] && [ "$(cat "$STATE" 2>/dev/null)" = "$SRC" ]; then
-  exit 0   # already the current version
+# Already current: same source path, same size, and the source not changed since the copy was made
+# (a file updated in place keeps its path). Cheaper than comparing ~300 MB every 15 minutes.
+if [ "${1:-}" != "--force" ] && [ -x "$DST" ] && [ "$(cat "$STATE" 2>/dev/null)" = "$SRC" ] \
+   && [ "$(wc -c < "$SRC")" = "$(wc -c < "$DST")" ] && [ -z "$(find "$SRC" -newer "$DST" 2>/dev/null)" ]; then
+  good
 fi
 
 TMP="$DST.tmp.$$"
 # cp -c = APFS clone on macOS (instant, no extra disk); plain copy elsewhere or if it fails
 { [ "$(uname -s)" = Darwin ] && cp -c "$SRC" "$TMP" 2>/dev/null; } || cp "$SRC" "$TMP" \
-  || { log "error: copy failed ($SRC)"; rm -f "$TMP"; exit 1; }
+  || { rm -f "$TMP"; fail "copy failed ($SRC)"; }
 CS="${STABLE_SYNC_CODESIGN:-codesign}"
+TEAM="${CLAUDE_STABLE_TEAM_ID-Q6L2SF6YDW}"
 if command -v "$CS" >/dev/null 2>&1; then
-  if ! "$CS" -v "$TMP" 2>/dev/null; then
-    log "error: invalid code signature on the copy of $SRC - kept the previous copy"; rm -f "$TMP"; exit 1
-  fi
+  if [ -n "$TEAM" ]; then
+    "$CS" -v -R="anchor apple generic and certificate leaf[subject.OU] = \"$TEAM\"" "$TMP" 2>/dev/null
+  else
+    "$CS" -v "$TMP" 2>/dev/null
+  fi || { rm -f "$TMP"; fail "invalid code signature (or not signed by team ${TEAM:-any}) on the copy of $SRC - kept the previous copy"; }
 else
   log "note: codesign not available - signature not checked"
 fi
 chmod 755 "$TMP"
-mv -f "$TMP" "$DST" || { log "error: could not move the copy into place"; rm -f "$TMP"; exit 1; }
+mv -f "$TMP" "$DST" || { rm -f "$TMP"; fail "could not move the copy into place"; }
 printf '%s\n' "$SRC" > "$STATE"
 log "ok: copied $SRC -> $DST"
+good

@@ -15,6 +15,7 @@ PY="$(command -v python3 || command -v python)"
 mkdir -p "$W/fakebin"
 # fake codesign: valid unless the file contains BADSIG
 printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$FAKE_DIR/codesign-calls"' 'f=""; for a; do f="$a"; done' \
+  'case "$*" in *-R*) grep -q ADHOC "$f" && exit 1 ;; esac' \
   '! grep -q BADSIG "$f"' > "$W/fakebin/codesign"
 printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$FAKE_DIR/launchctl-calls"' > "$W/fakebin/launchctl"
 chmod +x "$W/fakebin/codesign" "$W/fakebin/launchctl"
@@ -56,6 +57,43 @@ if [ $SYMLINKS = 1 ]; then
 else
   skip "symlink cases: this system makes copies instead of symlinks"
 fi
+if [ $SYMLINKS = 1 ]; then
+  # SSC-06: no `readlink -f` (macOS before 12.3) and no python3: the shell fallback resolves links
+  RL="$(command -v readlink)"; mkdir -p "$W/oldmac"
+  printf '#!/bin/sh\n[ "$1" = -f ] && exit 1\nexec %s "$@"\n' "$RL" > "$W/oldmac/readlink"
+  printf '#!/bin/sh\nexit 1\n' > "$W/oldmac/python3"; chmod +x "$W/oldmac/readlink" "$W/oldmac/python3"
+  mkdir -p "$W/chain/a" "$W/chain/b"; fakebin "$W/chain/b/real-claude" vchain
+  ln -s ../b/real-claude "$W/chain/a/link1"; ln -s "$W/chain/a/link1" "$W/chain/link2"
+  PATH="$W/oldmac:$PATH" CLAUDE_STABLE_SOURCE="$W/chain/link2" CLAUDE_STABLE_DIR="$W/oldmac-copy" sh "$CSS" 2>/dev/null
+  [ "$(sh "$W/oldmac-copy/claude" 2>/dev/null)" = vchain ] && grep -q "chain/b/real-claude" "$W/oldmac-copy/.source" \
+    && ok "no readlink -f and no python3: shell fallback follows relative links" || bad "fallback: $(tail -1 "$LOGF")"
+fi
+# SSC-02: a source file updated in place (same path) is copied again
+fakebin "$W/inplace" vA
+CLAUDE_STABLE_SOURCE="$W/inplace" CLAUDE_STABLE_DIR="$W/inplace-copy" sh "$CSS" 2>/dev/null
+sleep 1; fakebin "$W/inplace" vB-longer
+CLAUDE_STABLE_SOURCE="$W/inplace" CLAUDE_STABLE_DIR="$W/inplace-copy" sh "$CSS" 2>/dev/null
+[ "$(sh "$W/inplace-copy/claude")" = vB-longer ] && ok "source changed in place: copied again" || bad "stale copy: $(sh "$W/inplace-copy/claude")"
+# SSC-07: the signature must come from the expected team; an ad-hoc signature is refused
+: > "$W/codesign-calls"
+printf '#!/bin/sh\necho vadhoc # ADHOC\n' > "$W/adhoc"; chmod +x "$W/adhoc"
+CLAUDE_STABLE_SOURCE="$W/adhoc" CLAUDE_STABLE_DIR="$W/adhoc-copy" sh "$CSS" 2>/dev/null; rc=$?
+[ $rc = 1 ] && [ ! -e "$W/adhoc-copy/claude" ] && grep -q 'Q6L2SF6YDW' "$W/codesign-calls" \
+  && ok "ad-hoc signature refused; team id required (default Anthropic)" || bad "rc=$rc $(cat "$W/codesign-calls")"
+CLAUDE_STABLE_TEAM_ID= CLAUDE_STABLE_SOURCE="$W/adhoc" CLAUDE_STABLE_DIR="$W/adhoc-copy" sh "$CSS" 2>/dev/null
+[ "$(sh "$W/adhoc-copy/claude")" = vadhoc ] && ok "CLAUDE_STABLE_TEAM_ID empty: any valid signature" || bad "team id off"
+# SSC-08: repeated failures raise one alert outside the log, and success resets the count
+printf '#!/bin/sh\necho "$1" >> "%s/alerts"\n' "$W" > "$W/fakebin/alert"; chmod +x "$W/fakebin/alert"
+printf '#!/bin/sh\necho vbad # BADSIG\n' > "$W/badsrc"; chmod +x "$W/badsrc"
+for i in 1 2 3; do
+  STABLE_SYNC_ALERT_CMD="$W/fakebin/alert" STABLE_SYNC_ALERT_AFTER=2 CLAUDE_STABLE_SOURCE="$W/badsrc" \
+    CLAUDE_STABLE_DIR="$W/bad-copy" sh "$CSS" 2>/dev/null
+done
+[ "$(wc -l < "$W/alerts" 2>/dev/null | tr -d ' ')" = 1 ] && grep -q "claude-stable-sync" "$W/alerts" \
+  && ok "2 failures in a row: one alert; the 3rd stays quiet" || bad "alerts: $(cat "$W/alerts" 2>&1)"
+fakebin "$W/badsrc" vgood
+STABLE_SYNC_ALERT_CMD="$W/fakebin/alert" STABLE_SYNC_ALERT_AFTER=2 CLAUDE_STABLE_SOURCE="$W/badsrc" CLAUDE_STABLE_DIR="$W/bad-copy" sh "$CSS" 2>/dev/null
+[ ! -e "$W/logs/claude-stable-sync.failures" ] && ok "success resets the failure count" || bad "count kept"
 CLAUDE_STABLE_SOURCE="$W/nothing" sh "$CSS" 2>/dev/null; rc=$?
 [ $rc = 1 ] && grep -q "does not lead to an executable" "$LOGF" && ok "missing source: rc=1 with a clear log line" || bad "rc=$rc"
 CLAUDE_STABLE_SOURCE="$H/.local/share/claude/versions/1.0/claude" CLAUDE_STABLE_DIR="$W/alt" sh "$CSS" 2>/dev/null
@@ -77,13 +115,21 @@ OP_STABLE_SOURCE="$W/op-src" sh "$OSS" 2>/dev/null; rc=$?
 fakebin "$W/op-src" op3
 OP_STABLE_SOURCE="$W/op-src" OP_STABLE_DEST="$W/opdest/op" sh "$OSS" 2>/dev/null
 [ "$(sh "$W/opdest/op")" = op3 ] && ok "OP_STABLE_DEST honored" || bad "dest"
+# SSC-01: the temp file is unique (mktemp), so a fixed $DST.new left by another run does not matter
+mkdir -p "$W/opdest2/op.new"
+OP_STABLE_SOURCE="$W/op-src" OP_STABLE_DEST="$W/opdest2/op" sh "$OSS" 2>/dev/null; rc=$?
+[ $rc = 0 ] && [ "$(sh "$W/opdest2/op" 2>/dev/null)" = op3 ] && [ -d "$W/opdest2/op.new" ] && [ -z "$(ls -A "$W/opdest2/op.new")" ] \
+  && [ "$(ls "$W/opdest2" | wc -l | tr -d ' ')" = 2 ] && ok "unique temp file, nothing left behind" || bad "rc=$rc $(ls -R "$W/opdest2")"
+printf '#!/bin/sh\necho opadhoc # ADHOC\n' > "$W/op-adhoc"; chmod +x "$W/op-adhoc"
+OP_STABLE_SOURCE="$W/op-adhoc" OP_STABLE_DEST="$W/opdest3/op" sh "$OSS" 2>/dev/null; rc=$?
+[ $rc = 1 ] && [ ! -e "$W/opdest3/op" ] && grep -q '2BUA8C4S2C' "$W/codesign-calls" && ok "op: ad-hoc signature refused (team id)" || bad "rc=$rc"
 
 echo "== install.sh"
 I="$R/install.sh"
 OUT=$(INSTALL_OS=Darwin OP_STABLE_SOURCE="$W/op-src" bash "$I" --dry-run)
 [ ! -e "$H/.local/bin/claude-stable-sync" ] && [ ! -e "$H/Library" ] && echo "$OUT" | grep -q "would write" && ok "--dry-run writes nothing" || bad "$OUT"
 rm -f "$W/launchctl-calls"
-OUT=$(INSTALL_OS=Darwin OP_STABLE_SOURCE="$W/op-src" bash "$I" --prefix org.example)
+OUT=$(env -u STABLE_SYNC_LOG_DIR INSTALL_OS=Darwin OP_STABLE_SOURCE="$W/op-src" bash "$I" --prefix org.example)
 PC="$H/Library/LaunchAgents/org.example.claude-stable-sync.plist"
 PO="$H/Library/LaunchAgents/org.example.op-stable-sync.plist"
 [ -x "$H/.local/bin/claude-stable-sync" ] && [ -x "$H/.local/bin/op-stable-sync" ] && ok "tools copied" || bad "$OUT"
@@ -107,6 +153,25 @@ OUT=$(INSTALL_OS=Darwin bash "$I" --prefix org.only --only claude)
 [ -f "$H/Library/LaunchAgents/org.only.claude-stable-sync.plist" ] && [ ! -f "$H/Library/LaunchAgents/org.only.op-stable-sync.plist" ] && ok "--only claude" || bad "$OUT"
 OUT=$(INSTALL_OS=Linux bash "$I" --prefix org.linux)
 echo "$OUT" | grep -q "macOS-only" && ! ls "$H/Library/LaunchAgents/" | grep -q org.linux && ok "non-macOS: no jobs" || bad "$OUT"
+# SSC-05: STABLE_SYNC_LOG_DIR goes into both jobs (and their .err files)
+OUT=$(INSTALL_OS=Darwin STABLE_SYNC_LOG_DIR="$W/joblogs" bash "$I" --prefix org.logs)
+"$PY" - "$H/Library/LaunchAgents/org.logs.claude-stable-sync.plist" "$W/joblogs" <<'EOF' && ok "STABLE_SYNC_LOG_DIR written into the job" || bad "log dir not in job: $OUT"
+import plistlib, sys
+c = plistlib.load(open(sys.argv[1], "rb"))
+# Compared by the folder name: Git Bash on Windows rewrites path arguments for Python.
+assert c["EnvironmentVariables"]["STABLE_SYNC_LOG_DIR"].endswith("/joblogs"), c
+assert "/joblogs/" in c["StandardErrorPath"], c
+EOF
+# SSC-03: a failed copy of the tool stops the install with an error, and writes no job
+printf x > "$W/notadir"
+OUT=$(INSTALL_OS=Darwin INSTALL_BIN_DIR="$W/notadir/bin" bash "$I" --prefix org.fail 2>&1); rc=$?
+[ $rc != 0 ] && ! ls "$H/Library/LaunchAgents/" | grep -q org.fail && ok "copy failure: rc=$rc, no job written" || bad "rc=$rc $OUT"
+# SSC-04: a plist that does not validate never replaces the one in place
+mkdir -p "$W/badplutil"; printf '#!/bin/sh\nexit 1\n' > "$W/badplutil/plutil"; chmod +x "$W/badplutil/plutil"
+PK="$H/Library/LaunchAgents/org.keep.claude-stable-sync.plist"; printf 'OLD\n' > "$PK"
+OUT=$(PATH="$W/badplutil:$PATH" INSTALL_OS=Darwin bash "$I" --prefix org.keep --only claude 2>&1); rc=$?
+[ $rc != 0 ] && [ "$(cat "$PK")" = OLD ] && [ "$(ls "$H/Library/LaunchAgents/" | grep -c org.keep)" = 1 ] \
+  && ok "invalid new plist: old one kept, no temp left" || bad "rc=$rc $(cat "$PK") $OUT"
 OUT=$(INSTALL_OS=Darwin bash "$I" --uninstall --prefix org.example)
 [ ! -f "$PC" ] && [ ! -f "$PO" ] && [ ! -e "$H/.local/bin/claude-stable-sync" ] && [ "$(grep -c '^bootout gui/.*org.example' "$W/launchctl-calls")" -ge 4 ] \
   && echo "$OUT" | grep -q "stable copies were kept" && ok "--uninstall removes tools and jobs, keeps the copies" || bad "$OUT"
