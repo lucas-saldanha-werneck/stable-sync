@@ -158,8 +158,9 @@ OUT=$(INSTALL_OS=Darwin STABLE_SYNC_LOG_DIR="$W/joblogs" bash "$I" --prefix org.
 "$PY" - "$H/Library/LaunchAgents/org.logs.claude-stable-sync.plist" "$W/joblogs" <<'EOF' && ok "STABLE_SYNC_LOG_DIR written into the job" || bad "log dir not in job: $OUT"
 import plistlib, sys
 c = plistlib.load(open(sys.argv[1], "rb"))
-assert c["EnvironmentVariables"]["STABLE_SYNC_LOG_DIR"] == sys.argv[2], c
-assert c["StandardErrorPath"].startswith(sys.argv[2]), c
+# Compared by the folder name: Git Bash on Windows rewrites path arguments for Python.
+assert c["EnvironmentVariables"]["STABLE_SYNC_LOG_DIR"].endswith("/joblogs"), c
+assert "/joblogs/" in c["StandardErrorPath"], c
 EOF
 # SSC-03: a failed copy of the tool stops the install with an error, and writes no job
 printf x > "$W/notadir"
